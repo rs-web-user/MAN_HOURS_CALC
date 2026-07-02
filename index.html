@@ -206,6 +206,53 @@
     // Redmineの作業分類(activity)一覧を取得し、グローバルに保持
     let redmineActivities = [];
 
+    function jsonpRequest(url, params = {}, timeoutMs = 10000) {
+      return new Promise((resolve, reject) => {
+        const callbackName = `__redmineJsonpCallback_${Date.now()}_${Math.random()
+          .toString(36)
+          .slice(2)}`;
+        const script = document.createElement("script");
+        const timer = window.setTimeout(() => {
+          cleanup();
+          reject(new Error("JSONP request timed out"));
+        }, timeoutMs);
+
+        function cleanup() {
+          window.clearTimeout(timer);
+          delete window[callbackName];
+          if (script.parentNode) {
+            script.parentNode.removeChild(script);
+          }
+        }
+
+        window[callbackName] = (data) => {
+          cleanup();
+          resolve(data);
+        };
+
+        try {
+          const requestUrl = new URL(url);
+          for (const [key, value] of Object.entries(params)) {
+            if (value !== undefined && value !== null && value !== "") {
+              requestUrl.searchParams.set(key, value);
+            }
+          }
+          requestUrl.searchParams.set("callback", callbackName);
+
+          script.async = true;
+          script.onerror = () => {
+            cleanup();
+            reject(new Error("JSONP request failed"));
+          };
+          script.src = requestUrl.toString();
+          document.head.appendChild(script);
+        } catch (e) {
+          cleanup();
+          reject(e);
+        }
+      });
+    }
+
     function addProjectRow(project = "", start = "", end = "") {
       projectCount++;
       const projectsDiv = document.getElementById("projects");
@@ -763,9 +810,9 @@
           alert("必須項目が未入力の行があります。すべて入力してください。");
           return; // 1件でも不備があれば登録処理を行わない
         }
-        // ここから登録処理
-        let successCount = 0;
-        let failCount = 0;
+        // ここから送信処理。no-corsではレスポンスを読めないため結果は未確認扱い。
+        let sentCount = 0;
+        let failedCount = 0;
         for (let i = 1; i < rows.length; i++) {
           // 1行目はヘッダ
           const row = rows[i];
@@ -782,41 +829,37 @@
             row.style.backgroundColor = "";
             continue;
           }
-          const postData = {
-            time_entry: {
-              issue_id: Number(issueId),
-              spent_on: spentOn,
-              hours: Number(hours),
-              comments: comment || projectName || "",
-              activity_id: Number(activityId),
-            },
-          };
+          const postUrl = new URL(
+            `${redmineConfig.url.replace(/\/$/, "")}/time_entries.json`
+          );
+          postUrl.searchParams.set("key", redmineConfig.apiKey);
+
+          const postBody = new URLSearchParams();
+          postBody.set("time_entry[issue_id]", issueId);
+          postBody.set("time_entry[spent_on]", spentOn);
+          postBody.set("time_entry[hours]", hours);
+          postBody.set("time_entry[activity_id]", activityId);
+          postBody.set("time_entry[comments]", comment || projectName || "");
+
           try {
-            const res = await fetch(
-              `${redmineConfig.url.replace(/\/$/, "")}/time_entries.json`,
-              {
-                method: "POST",
-                headers: {
-                  "Content-Type": "application/json",
-                  "X-Redmine-API-Key": redmineConfig.apiKey,
-                },
-                body: JSON.stringify(postData),
-              }
-            );
-            if (res.ok) {
-              successCount++;
-              row.style.backgroundColor = "#61ff39"; // 成功時に行を緑色に
-            } else {
-              failCount++;
-              row.style.backgroundColor = "#ff0000"; // 失敗時に行を赤色に
-            }
+            await fetch(postUrl.toString(), {
+              method: "POST",
+              mode: "no-cors",
+              body: postBody,
+            });
+            sentCount++;
+            row.style.backgroundColor = "#fff3cd";
+            row.title = "Redmine送信済み（結果未確認）";
           } catch (e) {
-            failCount++;
+            failedCount++;
             row.style.backgroundColor = "#ff0000";
+            row.title = "Redmine送信失敗";
             console.error("Redmine登録エラー:", e);
           }
         }
-        alert(`Redmine登録完了\n成功: ${successCount}件\n失敗: ${failCount}件`);
+        alert(
+          `Redmine工数登録の送信完了\n送信済み（結果未確認）: ${sentCount}件\n通信失敗: ${failedCount}件\n\nno-cors送信のため、登録結果はRedmine画面で確認してください。`
+        );
       });
     // Redmine入力テーブルのチケット番号入力で案件名自動取得
     function enableRedmineIssueAutoFill() {
@@ -835,41 +878,30 @@
           const issueId = issueInput.value.trim();
           if (!issueId || !redmineConfig.url || !redmineConfig.apiKey) return;
           projectNameInput.value = "取得中...";
-          console.log("Redmine URL:", redmineConfig.url);
-          console.log("API Key:", redmineConfig.apiKey);
-          console.log(
-            "Fetch URL:",
-            `${redmineConfig.url.replace(/\/$/, "")}/issues/${issueId}.json`
-          );
+          const issueUrl = `${redmineConfig.url.replace(
+            /\/$/,
+            ""
+          )}/issues/${encodeURIComponent(issueId)}.json`;
+          console.log("Redmine issue JSONP URL:", issueUrl);
           try {
-            const res = await fetch(
-              `${redmineConfig.url.replace(/\/$/, "")}/issues/${issueId}.json`,
-              {
-                headers: { "X-Redmine-API-Key": redmineConfig.apiKey },
+            const data = await jsonpRequest(issueUrl, {
+              key: redmineConfig.apiKey,
+            });
+            if (data.issue && data.issue.subject) {
+              projectNameInput.value = data.issue.subject;
+              // ▼▼▼ 入力幅自動調整 ▼▼▼
+              let measurer = document.getElementById("input-width-measurer");
+              if (!measurer) {
+                measurer = document.createElement("span");
+                measurer.id = "input-width-measurer";
+                measurer.style.visibility = "hidden";
+                measurer.style.position = "absolute";
+                measurer.style.whiteSpace = "pre";
+                measurer.style.fontSize = "13px";
+                measurer.style.fontFamily = "inherit";
+                document.body.appendChild(measurer);
               }
-            );
-            if (res.ok) {
-              const data = await res.json();
-              if (data.issue && data.issue.subject) {
-                projectNameInput.value = data.issue.subject;
-                // ▼▼▼ 入力幅自動調整 ▼▼▼
-                let measurer = document.getElementById("input-width-measurer");
-                if (!measurer) {
-                  measurer = document.createElement("span");
-                  measurer.id = "input-width-measurer";
-                  measurer.style.visibility = "hidden";
-                  measurer.style.position = "absolute";
-                  measurer.style.whiteSpace = "pre";
-                  measurer.style.fontSize = "13px";
-                  measurer.style.fontFamily = "inherit";
-                  document.body.appendChild(measurer);
-                }
-                autoResizeInputWidth(projectNameInput, measurer);
-              } else {
-                projectNameInput.value = "";
-                let measurer = document.getElementById("input-width-measurer");
-                if (measurer) autoResizeInputWidth(projectNameInput, measurer);
-              }
+              autoResizeInputWidth(projectNameInput, measurer);
             } else {
               projectNameInput.value = "";
               let measurer = document.getElementById("input-width-measurer");
@@ -887,22 +919,17 @@
     // 作業分類一覧をRedmineから取得
     async function fetchRedmineActivities() {
       if (!redmineConfig.url || !redmineConfig.apiKey) return false;
+      const activitiesUrl = `${redmineConfig.url.replace(
+        /\/$/,
+        ""
+      )}/enumerations/time_entry_activities.json`;
       try {
-        const res = await fetch(
-          `${redmineConfig.url.replace(
-            /\/$/,
-            ""
-          )}/enumerations/time_entry_activities.json`,
-          {
-            headers: { "X-Redmine-API-Key": redmineConfig.apiKey },
-          }
-        );
-        if (res.ok) {
-          const data = await res.json();
-          if (data.time_entry_activities) {
-            redmineActivities = data.time_entry_activities;
-            return true;
-          }
+        const data = await jsonpRequest(activitiesUrl, {
+          key: redmineConfig.apiKey,
+        });
+        if (data.time_entry_activities) {
+          redmineActivities = data.time_entry_activities;
+          return true;
         }
       } catch (e) {
         console.error("Redmine activities fetch error:", e);
